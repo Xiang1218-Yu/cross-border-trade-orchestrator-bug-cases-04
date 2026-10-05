@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import {
-  addShipmentEvent, allocateOrder, cancelOrder, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, state, timeline, updateCustoms
+  addShipmentEvent, allocateOrder, cancelOrder, claimOutboxEvent, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, getOutboxEvent, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, retryOutboxEvent, state, timeline, updateCustoms
 } from './domain.js';
 
 const port = Number(process.env.PORT ?? 4120);
@@ -46,9 +46,14 @@ const server = createServer(async (req, res) => {
     const approvalId = path.match(/^\/api\/approvals\/([^/]+)\/decision$/)?.[1];
     if (method === 'POST' && approvalId) return success(res, decideApproval(tenant, approvalId, await readBody(req), user));
     if (method === 'GET' && path === '/api/audit/events') return success(res, listAudit(tenant, Number(url.searchParams.get('limit') ?? 100)));
-    if (method === 'GET' && path === '/api/outbox') return success(res, listOutbox(tenant, (url.searchParams.get('status') as 'pending' | 'published' | null) ?? undefined));
-    const eventId = path.match(/^\/api\/outbox\/([^/]+)\/publish$/)?.[1];
-    if (method === 'POST' && eventId) return success(res, publishOutbox(tenant, eventId, user));
+    if (method === 'GET' && path === '/api/outbox') return success(res, listOutbox(tenant, { status: (url.searchParams.get('status') as 'pending' | 'processing' | 'published' | 'failed' | null) ?? undefined, cursor: url.searchParams.get('cursor') ?? undefined, limit: Number(url.searchParams.get('limit') ?? 20) }));
+    const outboxEventId = path.match(/^\/api\/outbox\/([^/]+)$/)?.[1];
+    if (method === 'GET' && outboxEventId) return success(res, getOutboxEvent(tenant, outboxEventId));
+    const outboxAction = path.match(/^\/api\/outbox\/([^/]+)\/(claim|retry|publish)$/)?.[2];
+    const outboxActionId = path.match(/^\/api\/outbox\/([^/]+)\/(claim|retry|publish)$/)?.[1];
+    if (method === 'POST' && outboxAction === 'claim' && outboxActionId) return success(res, claimOutboxEvent(tenant, outboxActionId, user));
+    if (method === 'POST' && outboxAction === 'retry' && outboxActionId) return success(res, retryOutboxEvent(tenant, outboxActionId, user));
+    if (method === 'POST' && outboxAction === 'publish' && outboxActionId) { const body = await readBody(req); return success(res, publishOutbox(tenant, outboxActionId, user, { fail: body.fail as boolean | string | undefined })); }
     if (method === 'GET' && path === '/api/meta') return success(res, { tenant: state.tenants.find(item => item.id === tenant), capabilities: ['orders', 'inventory-reservation', 'shipment-tracking', 'customs-compliance', 'billing', 'approvals', 'audit', 'outbox'] });
     return failure(res, new Error('路由不存在'), 404);
   } catch (error) { return failure(res, error); }

@@ -19,22 +19,25 @@ type Invoice = { id: string; tenantId: string; orderId: string; number: string; 
 type Payment = { id: string; tenantId: string; invoiceId: string; amount: number; method: 'bank_transfer' | 'card' | 'credit_note'; reference: string; receivedAt: string };
 type Approval = { id: string; tenantId: string; orderId: string; type: 'credit_override' | 'customs_exception' | 'delay_compensation'; reason: string; status: ApprovalStatus; decidedBy?: string; comment?: string; createdAt: string; decidedAt?: string };
 export type AuditEvent = { id: string; tenantId: string; actor: string; action: string; entityType: string; entityId: string; before?: unknown; after?: unknown; at: string };
-export type OutboxEvent = { id: string; tenantId: string; topic: string; aggregateId: string; payload: unknown; status: 'pending' | 'published'; attempts: number; createdAt: string };
+export type OutboxStatus = 'pending' | 'processing' | 'published' | 'failed';
+export type OutboxEvent = { id: string; tenantId: string; topic: string; aggregateId: string; payload: unknown; status: OutboxStatus; attempts: number; claimedBy?: string; claimedAt?: string; lastError?: string; publishedAt?: string; retriedAt?: string; createdAt: string; updatedAt: string };
+type OutboxDelivery = { id: string; tenantId: string; eventId: string; topic: string; aggregateId: string; actor: string; at: string };
 
-type State = { tenants: Tenant[]; customers: Customer[]; orders: Order[]; inventory: InventoryLot[]; reservations: Reservation[]; shipments: Shipment[]; customs: CustomsDeclaration[]; invoices: Invoice[]; payments: Payment[]; approvals: Approval[]; audit: AuditEvent[]; outbox: OutboxEvent[] };
+type State = { tenants: Tenant[]; customers: Customer[]; orders: Order[]; inventory: InventoryLot[]; reservations: Reservation[]; shipments: Shipment[]; customs: CustomsDeclaration[]; invoices: Invoice[]; payments: Payment[]; approvals: Approval[]; audit: AuditEvent[]; outbox: OutboxEvent[]; outboxDeliveries: OutboxDelivery[] };
 const now = () => new Date().toISOString();
 const clone = <T>(value: T): T => structuredClone(value);
 const id = (prefix: string) => `${prefix}-${randomUUID().slice(0, 8).toUpperCase()}`;
 const money = (value: number) => Math.round(value * 100) / 100;
 
 export const state: State = {
-  tenants: [{ id: 'tenant-acme', name: 'Acme Global Trading', creditLimit: 250000, creditUsed: 36200, currency: 'USD' }],
-  customers: [{ id: 'CUS-001', tenantId: 'tenant-acme', name: 'Northstar Retail GmbH', creditLimit: 100000, creditUsed: 12000, blocked: false, timezone: 'Europe/Berlin' }, { id: 'CUS-002', tenantId: 'tenant-acme', name: 'Pacific Parts Inc.', creditLimit: 50000, creditUsed: 49000, blocked: false, timezone: 'America/Los_Angeles' }],
+  tenants: [{ id: 'tenant-acme', name: 'Acme Global Trading', creditLimit: 250000, creditUsed: 36200, currency: 'USD' }, { id: 'tenant-globex', name: 'Globex Cross Trade', creditLimit: 180000, creditUsed: 0, currency: 'EUR' }],
+  customers: [{ id: 'CUS-001', tenantId: 'tenant-acme', name: 'Northstar Retail GmbH', creditLimit: 100000, creditUsed: 12000, blocked: false, timezone: 'Europe/Berlin' }, { id: 'CUS-002', tenantId: 'tenant-acme', name: 'Pacific Parts Inc.', creditLimit: 50000, creditUsed: 49000, blocked: false, timezone: 'America/Los_Angeles' }, { id: 'CUS-101', tenantId: 'tenant-globex', name: 'Globex Sourcing Ltd.', creditLimit: 60000, creditUsed: 0, blocked: false, timezone: 'Asia/Shanghai' }],
   orders: [], inventory: [
     { id: 'LOT-001', tenantId: 'tenant-acme', warehouse: 'SHANGHAI-FTZ', sku: 'SENSOR-X9', available: 80, reserved: 10, lotCode: 'SX9-2608' },
     { id: 'LOT-002', tenantId: 'tenant-acme', warehouse: 'SHANGHAI-FTZ', sku: 'CONTROL-M2', available: 36, reserved: 4, lotCode: 'CM2-2607' },
-    { id: 'LOT-003', tenantId: 'tenant-acme', warehouse: 'ROTTERDAM-DC', sku: 'SENSOR-X9', available: 12, reserved: 0, lotCode: 'SX9-2606' }
-  ], reservations: [], shipments: [], customs: [], invoices: [], payments: [], approvals: [], audit: [], outbox: []
+    { id: 'LOT-003', tenantId: 'tenant-acme', warehouse: 'ROTTERDAM-DC', sku: 'SENSOR-X9', available: 12, reserved: 0, lotCode: 'SX9-2606' },
+    { id: 'LOT-201', tenantId: 'tenant-globex', warehouse: 'SHANGHAI-FTZ', sku: 'CONTROL-M2', available: 40, reserved: 0, lotCode: 'CM2-2609' }
+  ], reservations: [], shipments: [], customs: [], invoices: [], payments: [], approvals: [], audit: [], outbox: [], outboxDeliveries: []
 };
 
 function tenant(id: string) { const value = state.tenants.find(item => item.id === id); if (!value) throw new Error('租户不存在'); return value; }
@@ -42,7 +45,7 @@ function assertTenant<T extends { tenantId: string }>(item: T, tenantId: string)
 function customerFor(tenantId: string, customerId: string) { const customer = state.customers.find(item => item.id === customerId && item.tenantId === tenantId); if (!customer) throw new Error('客户不存在'); return customer; }
 function orderFor(tenantId: string, orderId: string) { const order = state.orders.find(item => item.id === orderId); if (!order) throw new Error('订单不存在'); return assertTenant(order, tenantId); }
 function record(tenantId: string, actor: string, action: string, entityType: string, entityId: string, before?: unknown, after?: unknown) { state.audit.unshift({ id: id('AUD'), tenantId, actor, action, entityType, entityId, before: before === undefined ? undefined : clone(before), after: after === undefined ? undefined : clone(after), at: now() }); }
-function emit(tenantId: string, topic: string, aggregateId: string, payload: unknown) { state.outbox.unshift({ id: id('EVT'), tenantId, topic, aggregateId, payload: clone(payload), status: 'pending', attempts: 0, createdAt: now() }); }
+function emit(tenantId: string, topic: string, aggregateId: string, payload: unknown) { const ts = now(); state.outbox.unshift({ id: id('EVT'), tenantId, topic, aggregateId, payload: clone(payload), status: 'pending', attempts: 0, createdAt: ts, updatedAt: ts }); }
 function mutate(tenantId: string, actor: string, action: string, type: string, entityId: string, before: unknown, after: unknown, topic: string) { record(tenantId, actor, action, type, entityId, before, after); if (action !== 'order.confirmed') emit(tenantId, topic, entityId, after); }
 function transition(order: Order, next: OrderStatus) { const allowed: Record<OrderStatus, OrderStatus[]> = { draft: ['confirmed', 'cancelled'], confirmed: ['allocated', 'cancelled'], allocated: ['dispatched', 'cancelled'], dispatched: ['delivered'], delivered: ['closed', 'dispatched'], closed: [], cancelled: [] }; if (!allowed[order.status].includes(next)) throw new Error(`订单不能从 ${order.status} 变更为 ${next}`); order.status = next; order.version += 1; order.updatedAt = now(); }
 
@@ -73,10 +76,95 @@ export function createApproval(tenantId: string, input: { orderId: string; type:
 export function decideApproval(tenantId: string, approvalId: string, input: { status: Exclude<ApprovalStatus, 'pending'>; comment?: string }, actor: string) { const approval = assertTenant(state.approvals.find(item => item.id === approvalId) ?? (() => { throw new Error('审批不存在'); })(), tenantId); if (approval.status !== 'pending') throw new Error('审批已经决策'); const before = clone(approval); approval.status = input.status; approval.decidedBy = actor; approval.comment = input.comment; approval.decidedAt = now(); if (input.status === 'approved' && approval.type === 'credit_override') { const order = orderFor(tenantId, approval.orderId); const customer = customerFor(tenantId, order.customerId); customer.creditLimit = Math.max(customer.creditLimit, customer.creditUsed + order.totalAmount); } mutate(tenantId, actor, 'approval.decided', 'approval', approval.id, before, approval, 'approval.decided'); return clone(approval); }
 
 export function operationSummary(tenantId: string) { tenant(tenantId); const orders = listOrders(tenantId); const invoices = state.invoices.filter(item => item.tenantId === tenantId); const shipments = state.shipments.filter(item => item.tenantId === tenantId); return { tenantId, generatedAt: now(), orderCount: orders.length, byStatus: orders.reduce<Record<string, number>>((acc, item) => { acc[item.status] = (acc[item.status] ?? 0) + 1; return acc; }, {}), grossMerchandiseValue: money(orders.reduce((sum, item) => sum + item.totalAmount, 0)), receivable: money(invoices.reduce((sum, item) => sum + item.total - item.paid, 0)), paid: money(invoices.reduce((sum, item) => sum + item.paid, 0)), delayedShipments: shipments.filter(item => item.status === 'exception').length, pendingApprovals: state.approvals.filter(item => item.tenantId === tenantId && item.status === 'pending').length, inventory: state.inventory.filter(item => item.tenantId === tenantId).map(item => ({ warehouse: item.warehouse, sku: item.sku, available: item.available, reserved: item.reserved, free: item.available - item.reserved })) }; }
-export function timeline(tenantId: string, orderId: string) { const order = orderFor(tenantId, orderId); const relatedIds = new Set([order.id]); const shipment = state.shipments.find(item => item.orderId === orderId); const customs = state.customs.find(item => item.orderId === orderId); const invoice = state.invoices.find(item => item.orderId === orderId); if (shipment) relatedIds.add(shipment.id); if (customs) relatedIds.add(customs.id); if (invoice) relatedIds.add(invoice.id); state.approvals.filter(item => item.orderId === orderId).forEach(item => relatedIds.add(item.id)); return state.audit.filter(item => item.tenantId === tenantId && relatedIds.has(item.entityId)).sort((a, b) => b.at.localeCompare(a.at)).map(clone); }
+export function timeline(tenantId: string, orderId: string) { const order = orderFor(tenantId, orderId); const relatedIds = new Set([order.id]); const shipment = state.shipments.find(item => item.orderId === orderId); const customs = state.customs.find(item => item.orderId === orderId); const invoice = state.invoices.find(item => item.orderId === orderId); if (shipment) relatedIds.add(shipment.id); if (customs) relatedIds.add(customs.id); if (invoice) relatedIds.add(invoice.id); state.approvals.filter(item => item.orderId === orderId).forEach(item => relatedIds.add(item.id)); state.outbox.filter(item => item.tenantId === tenantId && relatedIds.has(item.aggregateId)).forEach(item => relatedIds.add(item.id)); return state.audit.filter(item => item.tenantId === tenantId && relatedIds.has(item.entityId)).sort((a, b) => b.at.localeCompare(a.at)).map(clone); }
 export function listAudit(tenantId: string, limit = 100) { tenant(tenantId); return state.audit.filter(item => item.tenantId === tenantId).slice(0, Math.min(limit, 500)).map(clone); }
-export function listOutbox(tenantId: string, status?: OutboxEvent['status']) { tenant(tenantId); return state.outbox.filter(item => (!status || item.status === status)).map(clone); }
-export function publishOutbox(tenantId: string, eventId: string, actor = 'system') { const event = assertTenant(state.outbox.find(item => item.id === eventId) ?? (() => { throw new Error('事件不存在'); })(), tenantId); if (event.status === 'published') return clone(event); event.status = 'published'; event.attempts += 1; record(tenantId, actor, 'outbox.published', 'outbox', event.id, { status: 'pending' }, event); return clone(event); }
+export type OutboxPage = { items: OutboxEvent[]; nextCursor?: string; total: number };
+export type OutboxClaimResult = { outcome: 'claimed' | 'conflict'; event: OutboxEvent };
+export type OutboxRetryResult = { outcome: 'retried' | 'conflict'; event: OutboxEvent };
+export type OutboxPublishResult = { outcome: 'published' | 'already_published' | 'publish_failed' | 'conflict'; event: OutboxEvent; delivery?: OutboxDelivery | null; reason?: string };
+
+// 跨租户 ID 与不存在的 ID 必须返回完全一致的结果，避免资源存在性探测
+function outboxFor(tenantId: string, eventId: string): OutboxEvent {
+  const event = state.outbox.find(item => item.id === eventId && item.tenantId === tenantId);
+  if (!event) throw new Error('事件不存在');
+  return event;
+}
+const touch = (event: OutboxEvent) => { event.updatedAt = now(); };
+
+export function listOutbox(tenantId: string, options: OutboxStatus | { status?: OutboxStatus; cursor?: string; limit?: number } = {}): OutboxPage {
+  tenant(tenantId);
+  const input = typeof options === 'string' ? { status: options } : options;
+  const limit = Math.max(1, Math.min(input.limit ?? 20, 100));
+  const offset = input.cursor ? Number.parseInt(input.cursor, 10) || 0 : 0;
+  const ordered = state.outbox
+    .filter(item => item.tenantId === tenantId && (!input.status || item.status === input.status))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+  const items = ordered.slice(offset, offset + limit).map(clone);
+  return { items, nextCursor: offset + limit < ordered.length ? String(offset + limit) : undefined, total: ordered.length };
+}
+export function getOutboxEvent(tenantId: string, eventId: string): OutboxEvent { return clone(outboxFor(tenantId, eventId)); }
+
+// 领取：仅 pending 可被领取，检查与置位在同一同步操作内完成，杜绝并发重复领取
+export function claimOutboxEvent(tenantId: string, eventId: string, actor = 'system'): OutboxClaimResult {
+  tenant(tenantId);
+  const event = outboxFor(tenantId, eventId);
+  if (event.status !== 'pending') return { outcome: 'conflict', event: clone(event) };
+  const before = clone(event);
+  event.status = 'processing';
+  event.claimedBy = actor;
+  event.claimedAt = now();
+  touch(event);
+  record(tenantId, actor, 'outbox.claimed', 'outbox', event.id, before, event);
+  return { outcome: 'claimed', event: clone(event) };
+}
+
+// 失败重试：failed 回到 pending 并释放领取关系；其他状态给出一致的冲突结果，不重复投递
+export function retryOutboxEvent(tenantId: string, eventId: string, actor = 'system'): OutboxRetryResult {
+  tenant(tenantId);
+  const event = outboxFor(tenantId, eventId);
+  if (event.status !== 'failed') return { outcome: 'conflict', event: clone(event) };
+  const before = clone(event);
+  event.status = 'pending';
+  event.claimedBy = undefined;
+  event.claimedAt = undefined;
+  event.lastError = undefined;
+  event.retriedAt = now();
+  touch(event);
+  record(tenantId, actor, 'outbox.retried', 'outbox', event.id, before, event);
+  return { outcome: 'retried', event: clone(event) };
+}
+
+export function publishOutbox(tenantId: string, eventId: string, actor = 'system', options: { fail?: boolean | string } = {}): OutboxPublishResult {
+  tenant(tenantId);
+  const event = outboxFor(tenantId, eventId);
+  // 已发布：幂等返回，不再记录投递、不再写审计，杜绝重复投递
+  if (event.status === 'published') return { outcome: 'already_published', event: clone(event), delivery: null, reason: '事件已发布' };
+  // 未领取 / 领取后失败 / 状态已变化：统一冲突结果，由调用方先领取或先重试
+  if (event.status !== 'processing') return { outcome: 'conflict', event: clone(event), delivery: null, reason: '事件当前状态不允许发布' };
+  // 只有领取人本人可以发布，他人不能推进事件
+  if (event.claimedBy !== actor) return { outcome: 'conflict', event: clone(event), delivery: null, reason: '事件已被其他运营人员领取' };
+  const before = clone(event);
+  event.attempts += 1;
+  if (options.fail) {
+    event.status = 'failed';
+    event.lastError = typeof options.fail === 'string' ? options.fail : '投递失败';
+    touch(event);
+    record(tenantId, actor, 'outbox.publish_failed', 'outbox', event.id, before, event);
+    return { outcome: 'publish_failed', event: clone(event), delivery: null, reason: event.lastError };
+  }
+  // 投递台账兜底：同一事件只允许产生一条对外投递记录
+  if (!state.outboxDeliveries.some(item => item.eventId === event.id)) {
+    state.outboxDeliveries.push({ id: id('DLV'), tenantId, eventId: event.id, topic: event.topic, aggregateId: event.aggregateId, actor, at: now() });
+  }
+  event.status = 'published';
+  event.publishedAt = now();
+  event.lastError = undefined;
+  touch(event);
+  record(tenantId, actor, 'outbox.published', 'outbox', event.id, before, event);
+  const delivery = state.outboxDeliveries.find(item => item.eventId === event.id)!;
+  return { outcome: 'published', event: clone(event), delivery: clone(delivery) };
+}
+export function outboxDeliveryCount(tenantId: string, eventId: string): number { tenant(tenantId); return state.outboxDeliveries.filter(item => item.tenantId === tenantId && item.eventId === eventId).length; }
 
 
 export type OrderPage = { items: Order[]; nextCursor?: string; total: number };
@@ -99,3 +187,7 @@ export function invoiceOverdue(tenantId: string, invoiceId: string, asOf = new D
 // seed a coherent flow for demos: one order is allocated, one customs declaration is cleared, and one invoice is partially paid.
 const seeded = createOrder('tenant-acme', { customerId: 'CUS-001', reference: 'PO-2026-0918', origin: '上海保税区', destination: '鹿特丹', priority: 'urgent', items: [{ sku: 'SENSOR-X9', description: '工业温度传感器', quantity: 10, unitPrice: 180, weightKg: 2.4, hsCode: '9025.19' }, { sku: 'CONTROL-M2', description: '边缘控制模块', quantity: 4, unitPrice: 420, weightKg: 3.2, hsCode: '8537.10' }] });
 confirmOrder('tenant-acme', seeded.id); allocateOrder('tenant-acme', seeded.id); const seededDeclaration = createCustomsDeclaration('tenant-acme', { orderId: seeded.id }); updateCustoms('tenant-acme', seededDeclaration.id, { documentRefs: ['commercial-invoice', 'packing-list', 'origin-certificate'], status: 'submitted' }); updateCustoms('tenant-acme', seededDeclaration.id, { status: 'cleared' }); dispatchOrder('tenant-acme', seeded.id); const seededInvoice = generateInvoice('tenant-acme', seeded.id); recordPayment('tenant-acme', { invoiceId: seededInvoice.id, amount: 500, method: 'bank_transfer', reference: 'BANK-DEMO-001' });
+
+// seed a second, fully isolated tenant with its own pending outbox event
+const otherOrder = createOrder('tenant-globex', { customerId: 'CUS-101', reference: 'PO-2026-1001', origin: '深圳保税区', destination: '汉堡', items: [{ sku: 'CONTROL-M2', description: '边缘控制模块', quantity: 6, unitPrice: 420, weightKg: 3.0, hsCode: '8537.10' }] });
+emit('tenant-globex', 'order.noted', otherOrder.id, { note: 'tenant isolation seed' });
