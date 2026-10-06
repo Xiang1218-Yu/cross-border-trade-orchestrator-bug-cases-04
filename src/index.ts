@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
 import {
-  addShipmentEvent, allocateOrder, cancelOrder, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, generateInvoice, getOrder, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, state, timeline, updateCustoms
+  addShipmentEvent, allocateOrder, cancelOrder, claimOutbox, closeOrder, confirmOrder, createApproval, createCustomsDeclaration, createOrder, decideApproval, deliverOrder, dispatchOrder, failOutbox, generateInvoice, getOrder, getOutboxEvent, invoiceOverdue, listAudit, listOrders, listOrdersPage, listOutbox, operationSummary, publishOutbox, recordPayment, retryOutbox, state, timeline, updateCustoms,
+  type OutboxStatus
 } from './domain.js';
 
 const port = Number(process.env.PORT ?? 4120);
@@ -46,7 +47,15 @@ const server = createServer(async (req, res) => {
     const approvalId = path.match(/^\/api\/approvals\/([^/]+)\/decision$/)?.[1];
     if (method === 'POST' && approvalId) return success(res, decideApproval(tenant, approvalId, await readBody(req), user));
     if (method === 'GET' && path === '/api/audit/events') return success(res, listAudit(tenant, Number(url.searchParams.get('limit') ?? 100)));
-    if (method === 'GET' && path === '/api/outbox') return success(res, listOutbox(tenant, (url.searchParams.get('status') as 'pending' | 'published' | null) ?? undefined));
+    if (method === 'GET' && path === '/api/outbox') return success(res, listOutbox(tenant, { status: (url.searchParams.get('status') as OutboxStatus | null) ?? undefined, cursor: url.searchParams.get('cursor') ?? undefined, limit: url.searchParams.get('limit') ? Number(url.searchParams.get('limit')) : undefined }));
+    const outboxEventId = path.match(/^\/api\/outbox\/([^/]+)$/)?.[1];
+    if (method === 'GET' && outboxEventId) return success(res, getOutboxEvent(tenant, outboxEventId));
+    const claimId = path.match(/^\/api\/outbox\/([^/]+)\/claim$/)?.[1];
+    if (method === 'POST' && claimId) return success(res, claimOutbox(tenant, claimId, user));
+    const retryId = path.match(/^\/api\/outbox\/([^/]+)\/retry$/)?.[1];
+    if (method === 'POST' && retryId) return success(res, retryOutbox(tenant, retryId, user));
+    const failId = path.match(/^\/api\/outbox\/([^/]+)\/fail$/)?.[1];
+    if (method === 'POST' && failId) { const body = await readBody(req); return success(res, failOutbox(tenant, failId, user, body.reason ? String(body.reason) : undefined)); }
     const eventId = path.match(/^\/api\/outbox\/([^/]+)\/publish$/)?.[1];
     if (method === 'POST' && eventId) return success(res, publishOutbox(tenant, eventId, user));
     if (method === 'GET' && path === '/api/meta') return success(res, { tenant: state.tenants.find(item => item.id === tenant), capabilities: ['orders', 'inventory-reservation', 'shipment-tracking', 'customs-compliance', 'billing', 'approvals', 'audit', 'outbox'] });

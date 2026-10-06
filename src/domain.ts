@@ -19,7 +19,8 @@ type Invoice = { id: string; tenantId: string; orderId: string; number: string; 
 type Payment = { id: string; tenantId: string; invoiceId: string; amount: number; method: 'bank_transfer' | 'card' | 'credit_note'; reference: string; receivedAt: string };
 type Approval = { id: string; tenantId: string; orderId: string; type: 'credit_override' | 'customs_exception' | 'delay_compensation'; reason: string; status: ApprovalStatus; decidedBy?: string; comment?: string; createdAt: string; decidedAt?: string };
 export type AuditEvent = { id: string; tenantId: string; actor: string; action: string; entityType: string; entityId: string; before?: unknown; after?: unknown; at: string };
-export type OutboxEvent = { id: string; tenantId: string; topic: string; aggregateId: string; payload: unknown; status: 'pending' | 'published'; attempts: number; createdAt: string };
+export type OutboxStatus = 'pending' | 'processing' | 'published' | 'failed';
+export type OutboxEvent = { id: string; tenantId: string; topic: string; aggregateId: string; payload: unknown; status: OutboxStatus; attempts: number; claimedBy?: string; claimedAt?: string; publishedAt?: string; lastError?: string; createdAt: string; updatedAt: string };
 
 type State = { tenants: Tenant[]; customers: Customer[]; orders: Order[]; inventory: InventoryLot[]; reservations: Reservation[]; shipments: Shipment[]; customs: CustomsDeclaration[]; invoices: Invoice[]; payments: Payment[]; approvals: Approval[]; audit: AuditEvent[]; outbox: OutboxEvent[] };
 const now = () => new Date().toISOString();
@@ -42,7 +43,7 @@ function assertTenant<T extends { tenantId: string }>(item: T, tenantId: string)
 function customerFor(tenantId: string, customerId: string) { const customer = state.customers.find(item => item.id === customerId && item.tenantId === tenantId); if (!customer) throw new Error('客户不存在'); return customer; }
 function orderFor(tenantId: string, orderId: string) { const order = state.orders.find(item => item.id === orderId); if (!order) throw new Error('订单不存在'); return assertTenant(order, tenantId); }
 function record(tenantId: string, actor: string, action: string, entityType: string, entityId: string, before?: unknown, after?: unknown) { state.audit.unshift({ id: id('AUD'), tenantId, actor, action, entityType, entityId, before: before === undefined ? undefined : clone(before), after: after === undefined ? undefined : clone(after), at: now() }); }
-function emit(tenantId: string, topic: string, aggregateId: string, payload: unknown) { state.outbox.unshift({ id: id('EVT'), tenantId, topic, aggregateId, payload: clone(payload), status: 'pending', attempts: 0, createdAt: now() }); }
+function emit(tenantId: string, topic: string, aggregateId: string, payload: unknown) { state.outbox.unshift({ id: id('EVT'), tenantId, topic, aggregateId, payload: clone(payload), status: 'pending', attempts: 0, createdAt: now(), updatedAt: now() }); }
 function mutate(tenantId: string, actor: string, action: string, type: string, entityId: string, before: unknown, after: unknown, topic: string) { record(tenantId, actor, action, type, entityId, before, after); if (action !== 'order.confirmed') emit(tenantId, topic, entityId, after); }
 function transition(order: Order, next: OrderStatus) { const allowed: Record<OrderStatus, OrderStatus[]> = { draft: ['confirmed', 'cancelled'], confirmed: ['allocated', 'cancelled'], allocated: ['dispatched', 'cancelled'], dispatched: ['delivered'], delivered: ['closed', 'dispatched'], closed: [], cancelled: [] }; if (!allowed[order.status].includes(next)) throw new Error(`订单不能从 ${order.status} 变更为 ${next}`); order.status = next; order.version += 1; order.updatedAt = now(); }
 
@@ -75,8 +76,47 @@ export function decideApproval(tenantId: string, approvalId: string, input: { st
 export function operationSummary(tenantId: string) { tenant(tenantId); const orders = listOrders(tenantId); const invoices = state.invoices.filter(item => item.tenantId === tenantId); const shipments = state.shipments.filter(item => item.tenantId === tenantId); return { tenantId, generatedAt: now(), orderCount: orders.length, byStatus: orders.reduce<Record<string, number>>((acc, item) => { acc[item.status] = (acc[item.status] ?? 0) + 1; return acc; }, {}), grossMerchandiseValue: money(orders.reduce((sum, item) => sum + item.totalAmount, 0)), receivable: money(invoices.reduce((sum, item) => sum + item.total - item.paid, 0)), paid: money(invoices.reduce((sum, item) => sum + item.paid, 0)), delayedShipments: shipments.filter(item => item.status === 'exception').length, pendingApprovals: state.approvals.filter(item => item.tenantId === tenantId && item.status === 'pending').length, inventory: state.inventory.filter(item => item.tenantId === tenantId).map(item => ({ warehouse: item.warehouse, sku: item.sku, available: item.available, reserved: item.reserved, free: item.available - item.reserved })) }; }
 export function timeline(tenantId: string, orderId: string) { const order = orderFor(tenantId, orderId); const relatedIds = new Set([order.id]); const shipment = state.shipments.find(item => item.orderId === orderId); const customs = state.customs.find(item => item.orderId === orderId); const invoice = state.invoices.find(item => item.orderId === orderId); if (shipment) relatedIds.add(shipment.id); if (customs) relatedIds.add(customs.id); if (invoice) relatedIds.add(invoice.id); state.approvals.filter(item => item.orderId === orderId).forEach(item => relatedIds.add(item.id)); return state.audit.filter(item => item.tenantId === tenantId && relatedIds.has(item.entityId)).sort((a, b) => b.at.localeCompare(a.at)).map(clone); }
 export function listAudit(tenantId: string, limit = 100) { tenant(tenantId); return state.audit.filter(item => item.tenantId === tenantId).slice(0, Math.min(limit, 500)).map(clone); }
-export function listOutbox(tenantId: string, status?: OutboxEvent['status']) { tenant(tenantId); return state.outbox.filter(item => (!status || item.status === status)).map(clone); }
-export function publishOutbox(tenantId: string, eventId: string, actor = 'system') { const event = assertTenant(state.outbox.find(item => item.id === eventId) ?? (() => { throw new Error('事件不存在'); })(), tenantId); if (event.status === 'published') return clone(event); event.status = 'published'; event.attempts += 1; record(tenantId, actor, 'outbox.published', 'outbox', event.id, { status: 'pending' }, event); return clone(event); }
+export type OutboxPage = { items: OutboxEvent[]; nextCursor?: string; total: number };
+// Tenant-scoped lookup: cross-tenant ids and unknown ids intentionally raise the same
+// '事件不存在' error so callers cannot probe whether another tenant's event exists.
+function outboxFor(tenantId: string, eventId: string) { const event = state.outbox.find(item => item.id === eventId && item.tenantId === tenantId); if (!event) throw new Error('事件不存在'); return event; }
+export function listOutbox(tenantId: string, input: { status?: OutboxStatus; cursor?: string; limit?: number } = {}): OutboxPage {
+  tenant(tenantId);
+  const parsed = Number(input.limit ?? 20);
+  const limit = Number.isFinite(parsed) ? Math.max(1, Math.min(Math.trunc(parsed), 100)) : 20;
+  const offset = input.cursor ? Number.parseInt(input.cursor, 10) || 0 : 0;
+  const filtered = state.outbox.filter(item => item.tenantId === tenantId && (!input.status || item.status === input.status));
+  return { items: filtered.slice(offset, offset + limit).map(clone), nextCursor: offset + limit < filtered.length ? String(offset + limit) : undefined, total: filtered.length };
+}
+export function getOutboxEvent(tenantId: string, eventId: string) { tenant(tenantId); return clone(outboxFor(tenantId, eventId)); }
+export function claimOutbox(tenantId: string, eventId: string, actor = 'system') {
+  tenant(tenantId); const event = outboxFor(tenantId, eventId);
+  if (event.status === 'processing') throw new Error('事件已被领取');
+  if (event.status === 'published') throw new Error('事件已发布，不能领取');
+  if (event.status === 'failed') throw new Error('事件已失败，请先重试');
+  const before = clone(event); event.status = 'processing'; event.claimedBy = actor; event.claimedAt = now(); event.updatedAt = now();
+  record(tenantId, actor, 'outbox.claimed', 'outbox', event.id, { status: before.status }, event); return clone(event);
+}
+export function failOutbox(tenantId: string, eventId: string, actor = 'system', reason?: string) {
+  tenant(tenantId); const event = outboxFor(tenantId, eventId);
+  if (event.status === 'published') throw new Error('事件已发布，不能标记失败');
+  if (event.status === 'failed') throw new Error('事件已处于失败状态');
+  const before = clone(event); event.status = 'failed'; event.attempts += 1; event.lastError = reason ?? '投递失败'; event.updatedAt = now();
+  record(tenantId, actor, 'outbox.failed', 'outbox', event.id, { status: before.status }, event); return clone(event);
+}
+export function retryOutbox(tenantId: string, eventId: string, actor = 'system') {
+  tenant(tenantId); const event = outboxFor(tenantId, eventId);
+  if (event.status !== 'failed') throw new Error('只有失败的事件才能重试');
+  const before = clone(event); event.status = 'pending'; event.claimedBy = undefined; event.claimedAt = undefined; event.updatedAt = now();
+  record(tenantId, actor, 'outbox.retried', 'outbox', event.id, { status: before.status }, event); return clone(event);
+}
+export function publishOutbox(tenantId: string, eventId: string, actor = 'system') {
+  tenant(tenantId); const event = outboxFor(tenantId, eventId);
+  if (event.status === 'published') return clone(event);
+  if (event.status === 'failed') throw new Error('事件处于失败状态，请先重试');
+  const before = clone(event); event.status = 'published'; event.attempts += 1; event.publishedAt = now(); event.updatedAt = now();
+  record(tenantId, actor, 'outbox.published', 'outbox', event.id, { status: before.status }, event); return clone(event);
+}
 
 
 export type OrderPage = { items: Order[]; nextCursor?: string; total: number };
